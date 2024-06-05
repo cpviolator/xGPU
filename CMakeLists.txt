@@ -151,4 +151,15 @@ message(STATUS "XGPU NTIME_PIPE: ${XGPU_NTIME_PIPE}")
 
 # Add src, tests
 add_subdirectory(src)
-#add_subdirectory(tests)
+
+# Install project cmake targets
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+  ${PROJECT_NAME}-config-version.cmake
+  VERSION ${xGPU_VERSION}
+  COMPATIBILITY AnyNewerVersion
+)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config-version.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
+)
+
