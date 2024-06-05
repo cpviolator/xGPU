@@ -1,15 +1,11 @@
 // Define TEXTURE_DIM as 1 to use 1D texture (more accurate, costs 1 mult per LOAD)
 // Define TEXTURE_DIM as 2 to use 2D texture (less accurate, saves 1 mult per LOAD)
-#ifndef TEXTURE_DIM
-#define TEXTURE_DIM 1
-#endif
 
 #if TEXTURE_DIM == 1
 
 // Read char4 from global, write int to shared memory avoid bank conflict.
-#define LOAD(s, t)							\
-  { int2 c = tex1Dfetch(tex1dchar4, array_index + (t)*NFREQUENCY*NSTATION*NPOL); \
-    CUBE_ADD_BYTES(4*sizeof(ComplexInput));				\
+#define LOAD(s, t, tex)							\
+  { int2 c = tex1Dfetch<int2>(tex, array_index + (t)*NFREQUENCY*NSTATION*NPOL); \
     *(input##s##_p) = c.x;						\
     *(input##s##_p + 4*TILE_WIDTH) = c.y;}
 
@@ -20,11 +16,10 @@
 
 // Read float2 from global, write individual floats
 // to shared memory avoid bank conflict.
-#define LOAD(s, t)							\
+#define LOAD(s, t, tex_obj)							\
   {  int4 c;								\
-    asm("tex.2d.v4.s32.s32 {%0, %1, %2, %3}, [tex2dchar4, {%4, %5}];" :	\
+    asm("tex.2d.v4.s32.s32 {%0, %1, %2, %3}, [tex_obj, {%4, %5}];" :	\
 	"=r"(c.x), "=r"(c.y), "=r"(c.z), "=r"(c.w) : "r"(array_index), "r"(t)); \
-    CUBE_ADD_BYTES(4*sizeof(ComplexInput));				\
     *(input##s##_p) = c.x;						\
     *(input##s##_p + 4*TILE_WIDTH) = c.y;}
 
@@ -32,9 +27,8 @@
 
 // Read char4 from global, write individual floats
 // to shared memory avoid bank conflict.
-#define LOAD(s, t)							\
-  { int2 c = tex2D(tex2dchar4, array_index, t);				\
-    CUBE_ADD_BYTES(4*sizeof(ComplexInput));				\
+#define LOAD(s, t, tex)							\
+  { int2 c = tex2D<int2>(tex, array_index, t);				\
     *(input##s##_p) = c.x;						\
     *(input##s##_p + 4*TILE_WIDTH) = c.y;}
 #endif  // use float texture coordinates

@@ -3,13 +3,14 @@
 
 #include "xgpu.h" // For MATRIX_ORDER_XXX macros
 
+/*
 // Sizing parameters (fixed for now)
 #ifndef NPOL
 #define NPOL 2
 #endif
 
 #ifndef NSTATION
-#define NSTATION 256
+#define NSTATION 32
 #endif
 
 #ifndef NFREQUENCY
@@ -17,22 +18,17 @@
 #endif
 
 #ifndef NTIME
-#define NTIME 1024
+#define NTIME 100
 #endif
 
 #ifndef NTIME_PIPE
-#define NTIME_PIPE 128
+#define NTIME_PIPE 20
 #endif
+*/
 
 // Ensure that NTIME_PIPE is a multiple of 4
-#ifndef DP4A
 #if (NTIME_PIPE/4)*4 != NTIME_PIPE
 #error NTIME_PIPE must be a multiple of 4
-#endif
-#else
-#if (NTIME_PIPE/16)*16 != NTIME_PIPE
-#error For DP4A: NTIME_PIPE must be a multiple of 16
-#endif
 #endif
 
 // Ensure that NTIME is a multiple of NTIME_PIPE

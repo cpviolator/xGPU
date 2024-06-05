@@ -2,7 +2,7 @@
 # (usually sizing for a specific project)
 -include Makefile.local
 
-CUDA_DIR ?= /usr/local/cuda
+CUDA_DIR ?= /usr/local/cuda-12.2
 ifneq ($(strip $(OSTYPE)),osx)
 CUDA_LIBDIR ?= $(CUDA_DIR)/lib64
 else
@@ -11,15 +11,13 @@ endif
 
 DEBUG ?= -O3
 TEXTURE_DIM ?= 1
-CUDA_ARCH ?= sm_30
+CUDA_ARCH ?= sm_70
 
 NVCC = $(CUDA_DIR)/bin/nvcc
 prefix ?= /usr/local
 bindir ?= $(prefix)/bin
 libdir ?= $(prefix)/lib
 includedir ?= $(prefix)/include
-datadir ?= $(prefix)/share
-aclocaldir ?= $(datadir)/aclocal
 
 ifeq ($(strip $(OSTYPE)),cygwin)
 NVCCFLAGS = --compiler-bindir "c:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin" -Xcompiler /openmp
@@ -31,7 +29,7 @@ else
 NVCCFLAGS = -Xcompiler -D_REENTRANT -Xcompiler -Wall -Xcompiler -Wno-unused-function -ftz=true
 
 ifneq ($(strip $(OSTYPE)),osx)
-NVCCFLAGS += -Xcompiler -fopenmp
+NVCCFLAGS += -Xcompiler -fopenmp 
 else
 NVCCFLAGS += -Xcompiler -Wno-unknown-pragmas -Xcompiler -Wno-gnu-designator
 endif
@@ -46,8 +44,13 @@ RPATH = -Xlinker -rpath,'$${ORIGIN}:$${ORIGIN}/../lib'
 LIBXGPU = libxgpu.so
 endif
 
-NVCCFLAGS += $(DEBUG) -arch=$(CUDA_ARCH) --ptxas-options=-v -prec-sqrt=false -Xcompiler -fPIC
-NVCCFLAGS += -DTEXTURE_DIM=$(TEXTURE_DIM)
+#OLD
+#NVCCFLAGS += $(DEBUG) -arch=$(CUDA_ARCH) -Xptxas -abi=no --ptxas-options=-v -prec-sqrt=false -Xcompiler -fPIC
+#NVCCFLAGS += -DTEXTURE_DIM=$(TEXTURE_DIM)
+
+#NEW
+NVCCFLAGS += $(DEBUG) -arch=$(CUDA_ARCH) 
+#NVCCFLAGS += -DTEXTURE_DIM=$(TEXTURE_DIM)
 
 ifeq ($(strip $(CUDA_ARCH)),sm_35)
 NVCCFLAGS += -maxrregcount=72
@@ -112,36 +115,14 @@ endif
 # Benchmarking variable handlers
 ################################
 
-ifdef CUBE_COUNT_MODE
-NVCCFLAGS += -DCUBE_COUNT_MODE
-CUBE_OBJS = cube/cube.o
-endif
-
-ifdef CUBE_TIME_MODE
-# FIXME? The test seems to fail on the timing run - why is this? - summation is doubled for some reason
-NVCCFLAGS += -DCUBE_TIME_MODE
-CUBE_OBJS = cube/cube.o
-endif
-
-ifdef CUBE_ASYNC_COUNT_MODE
-NVCCFLAGS += -DCUBE_ASYNC_COUNT_MODE
-CUBE_OBJS = cube/cube.o
-endif
-
-ifdef CUBE_ASYNC_TIME_MODE
-NVCCFLAGS += -DCUBE_ASYNC_TIME_MODE
-CUBE_OBJS = cube/cube.o
+# this sets benchmarking mode - no correctness testing done
+ifeq ($(strip $(BENCHMARK)), yes)
+NVCCFLAGS += -DBENCHMARK
 endif
 
 # this sets the pipeline to run in an infinite loop - for power measurement
 ifeq ($(strip $(POWER_LOOP)), yes)
 NVCCFLAGS += -DPOWER_LOOP
-endif
-
-# If DP4A is defined, the library does all computation using native
-# 8-bit integer multiplication and 32-bit accumulation
-ifeq ($(strip $(DP4A)), yes)
-NVCCFLAGS += -DDP4A
 endif
 
 ifdef RUNTIME_STATS
@@ -164,7 +145,6 @@ BINXGPU_OBJS = $(CUDA_CORRELATOR_OBJS) $(XGPUINFO_OBJS)
 LIBXGPU_OBJS  = cuda_xengine.o
 LIBXGPU_OBJS += omp_xengine.o
 LIBXGPU_OBJS += cpu_util.o
-LIBXGPU_OBJS += $(CUBE_OBJS)
 
 # Each object file has a corresponding dependency file
 DEPS = $(BINXGPU_OBJS:.o=.d) $(LIBXGPU_OBJS:.o=.d)
@@ -172,10 +152,10 @@ DEPS = $(BINXGPU_OBJS:.o=.d) $(LIBXGPU_OBJS:.o=.d)
 all: cuda_correlator xgpuinfo $(LIBXGPU)
 
 cuda_correlator: $(CUDA_CORRELATOR_OBJS) $(LIBXGPU)
-	$(NVCC) $(NVCCFLAGS) $(CUDA_CORRELATOR_OBJS) -o $@ $(LFLAGS) $(RPATH) -lxgpu -lrt
+	$(NVCC) $(NVCCFLAGS) $(CUDA_CORRELATOR_OBJS) -o $@ $(LFLAGS) $(RPATH) -lxgpu -lnvidia-ml
 
 xgpuinfo: $(XGPUINFO_OBJS) $(LIBXGPU)
-	$(NVCC) $(NVCCFLAGS) $(XGPUINFO_OBJS) -o $@ $(LFLAGS) $(RPATH) -lxgpu
+	$(NVCC) $(NVCCFLAGS) $(XGPUINFO_OBJS) -o $@ $(LFLAGS) $(RPATH) -lxgpu -lnvidia-ml
 
 $(LIBXGPU): $(LIBXGPU_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LFLAGS) --shared
@@ -193,39 +173,43 @@ objs: $(BINXGPU_OBJS) $(LIBXGPU_OBJS)
 # NB Include dep files using "-include", see
 #    http://make.paulandlesley.org/autodep.html#traditional for more info.
 
-%.o: %.c
-	$(VERBOSE)$(NVCC) $(NVCCFLAGS) -M -o $*.P $< && \
-	cp $*.P $*.d && \
-	sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
-		  -e '/^$$/ d' -e 's/$$/ :/' < $*.P >> $*.d && \
-	rm -f $*.P
-	$(NVCC) $(NVCCFLAGS) $(CFLAGS) -c -o $@ $<
+#DMH Removed -M flag from %.o
 
-%.o: %.cu
-	$(VERBOSE)$(NVCC) $(NVCCFLAGS) -M -o $*.P $< && \
-	cp $*.P $*.d && \
-	sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
-		  -e '/^$$/ d' -e 's/$$/ :/' < $*.P >> $*.d && \
-	rm -f $*.P
-	$(NVCC) $(NVCCFLAGS) $(CFLAGS) -c -o $@ $<
+ %.o: %.c
+	$(VERBOSE)$(NVCC) $(NVCCFLAGS) $(CFLAGS) -c -o $@ $<
 
-install: cuda_correlator xgpuinfo $(LIBXGPU)
+ %.o: %.cu
+	$(VERBOSE)$(NVCC) $(NVCCFLAGS) $(CFLAGS) -c -o $@ $<
+
+
+# %.o: %.c
+# 	$(VERBOSE)$(NVCC) $(NVCCFLAGS) -M -o $*.P $< && \
+# 	cp $*.P $*.d && \
+# 	sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
+# 		  -e '/^$$/ d' -e 's/$$/ :/' < $*.P >> $*.d && \
+# 	rm -f $*.P
+# 	$(NVCC) $(NVCCFLAGS) $(CFLAGS) -c -o $@ $<
+
+# %.o: %.cu
+# 	$(VERBOSE)$(NVCC) $(NVCCFLAGS) -M -o $*.P $< && \
+# 	cp $*.P $*.d && \
+# 	sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
+# 		  -e '/^$$/ d' -e 's/$$/ :/' < $*.P >> $*.d && \
+# 	rm -f $*.P
+# 	$(NVCC) $(NVCCFLAGS) $(CFLAGS) -c -o $@ $<
+
+install: xgpuinfo $(LIBXGPU)
 	mkdir -p $(bindir)
-	cp cuda_correlator $(bindir)
 	cp xgpuinfo $(bindir)
 	mkdir -p $(includedir)
 	cp xgpu.h $(includedir)
 	mkdir -p $(libdir)
 	cp $(LIBXGPU) $(libdir)
-	mkdir -p $(aclocaldir)
-	cp xgpu.m4 $(aclocaldir)
 
 uninstall:
-	rm -f $(bindir)/cuda_correlator
 	rm -f $(bindir)/xgpuinfo
 	rm -f $(includedir)/xgpu.h
 	rm -f $(libdir)/$(LIBXGPU)
-	rm -f $(aclocaldir)/xgpu.m4
 
 tags:
 	ctags -R .
@@ -241,8 +225,9 @@ show:
 
 clean:
 	rm -f cuda_correlator libxgpu.so xgpuinfo
-	rm -f $(BINXGPU_OBJS) $(LIBXGPU_OBJS) cube/cube.o
+	rm -f $(BINXGPU_OBJS) $(LIBXGPU_OBJS)
 	rm -f $(DEPS)
 	rm -f tags
+	rm -f gpu_monitor*out
 
 .PHONY : all objs tags clean install uninstall show

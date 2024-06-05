@@ -1,18 +1,15 @@
 // Define TEXTURE_DIM as 1 to use 1D texture (more accurate, costs 1 mult per LOAD)
 // Define TEXTURE_DIM as 2 to use 2D texture (less accurate, saves 1 mult per LOAD)
-#ifndef TEXTURE_DIM
-#define TEXTURE_DIM 1
-#endif
 
 #if TEXTURE_DIM == 1
+#warning "TEXT DIM 1 shared_transfer_8.cuh"
 // Read in column in first warp as float2, row in second warp (still true for 1D?)
 #define LOAD(s, t)							\
   {float2 temp = tex1Dfetch(tex1dfloat2, array_index + (t)*NFREQUENCY*Nstation*NPOL); \
-    CUBE_ADD_BYTES(sizeof(ComplexInput));				\
     *(input##s##_p) = temp; }
 
 #elif TEXTURE_DIM == 2
-
+#warning "TEXT DIM 2 shared_transfer_8.cuh"
 //#define TEXTURE_FLOAT_COORD
 #ifndef TEXTURE_FLOAT_COORD // use integer texture coordinates (requires ptx)
 
@@ -22,7 +19,6 @@
   { float4 temp;							\
     asm("tex.2d.v4.f32.s32 {%0, %1, %2, %3}, [tex2dfloat2, {%4, %5}];" : \
 	"=f"(temp.x), "=f"(temp.y), "=f"(temp.z), "=f"(temp.w) : "r"(array_index), "r"(t)); \
-    CUBE_ADD_BYTES(sizeof(ComplexInput));				\
     *(input##s##_p) = make_float2(temp.x, temp.y); }
 
 #else // use float texture coordinates
@@ -30,7 +26,6 @@
 // Read in column in first warp as float2, row in second warp
 #define LOAD(s, t)							\
   {float2 temp = tex2D(tex2dfloat2, array_index, t);			\
-    CUBE_ADD_BYTES(sizeof(ComplexInput));				\
     *(input##s##_p) = temp; }
 
 #endif // TEXTURE_FLOAT_COORD

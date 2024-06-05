@@ -13,11 +13,12 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <nvml.h>
 
 #include "xgpu.h"
 #include "xgpu_info.h"
 #include "xgpu_version.h"
-#include "cube/cube.h"
+#include "power.h"
 
 // whether we are writing the matrix back to device memory (used for benchmarking)
 static int writeMatrix = 1;
@@ -70,22 +71,6 @@ typedef struct XGPUInternalContextStruct {
 
 #define REG_TILE_NBASELINE ((NSTATION/2+1)*(NSTATION/4))
 
-#ifndef FIXED_POINT
-// texture declaration for FP32 reads
-static texture<float2, 1, cudaReadModeElementType> tex1dfloat2;
-static texture<float2, 2, cudaReadModeElementType> tex2dfloat2;
-#else
-#ifdef DP4A
-// texture declaration for swizzled 8-bit fixed point reads
-static texture<int2, 1, cudaReadModeElementType> tex1dchar4;
-static texture<int2, 2, cudaReadModeElementType> tex2dchar4;
-#else
-// texture declaration for 8-bit fixed point reads
-static texture<char2, 1, cudaReadModeNormalizedFloat> tex1dfloat2;
-static texture<char2, 2, cudaReadModeNormalizedFloat> tex2dfloat2;
-#endif
-#endif
-
 // array holding indices for which matrix we are doing the output to at a given iteration
 #if (NPULSAR > 0)
 static __device__ __constant__ unsigned char tIndex[PIPE_LENGTH*NFREQUENCY];
@@ -127,7 +112,7 @@ static XGPUInfo compiletime_info = {
 #else
   .compute_type = XGPU_FLOAT32,
 #endif
-  .vecLength  =  NFREQUENCY * NTIME * NSTATION * NPOL,
+  .vecLength  =  NFREQUENCY * NTIME * (long)NSTATION * NPOL,
   .vecLengthPipe = NFREQUENCY * NTIME_PIPE * NSTATION * NPOL,
 #if (MATRIX_ORDER == REGISTER_TILE_TRIANGULAR_ORDER)
   .matLength =   NFREQUENCY * ((NSTATION/2+1)*(NSTATION/4)*NPOL*NPOL*4) * (NPULSAR + 1),
@@ -171,6 +156,8 @@ void xgpuInfo(XGPUInfo *pcxs)
   pcxs->complex_block_size = compiletime_info.complex_block_size;
 }
 
+static int cuda_cores;
+
 // Initialize the XGPU.  The device number is intentionally not part of the
 // context because the device number needs to be maintained as part of the
 // internal context (.e.g to ensure consistency with the device on which memory
@@ -180,8 +167,6 @@ void xgpuInfo(XGPUInfo *pcxs)
 int xgpuInit(XGPUContext *context, int device_flags)
 {
   int error = XGPU_OK;
-
-  CUBE_INIT();
 
   // Allocate internal context
   XGPUInternalContext *internal = (XGPUInternalContext *)malloc(sizeof(XGPUInternalContext));
@@ -219,7 +204,8 @@ int xgpuInit(XGPUContext *context, int device_flags)
   }
 
   cudaGetDeviceProperties(&deviceProp, internal->device);
-  printf("Using device %d: %s\n", internal->device, deviceProp.name);
+  cuda_cores = _ConvertSMVer2Cores(deviceProp.major, deviceProp.minor) * deviceProp.multiProcessorCount;
+  printf("Using device %d: %s with %d CUDA cores\n", internal->device, deviceProp.name, cuda_cores);
 
   //assign the device
   cudaSetDevice(internal->device);
@@ -326,6 +312,8 @@ int xgpuInit(XGPUContext *context, int device_flags)
   }
 #endif
 #endif 
+
+  GPUmonitorInit(internal->device);
 
   return XGPU_OK;
 }
@@ -537,8 +525,26 @@ void xgpuFree(XGPUContext *context)
     context->internal = NULL;
   }
 
-  CUBE_WRITE();
+  GPUmonitorFree();
+
 }
+
+#define XGPU_ASYNC_START(label)			\
+  {						\
+    cudaEvent_t start##label, end##label;	\
+    cudaEventCreate(&start##label);		\
+    cudaEventCreate(&end##label);		\
+    cudaEventSynchronize(start##label);		\
+    cudaEventRecord(start##label, 0);		\
+
+#define XGPU_ASYNC_END(label)						\
+    cudaEventRecord(end##label, 0);					\
+    cudaEventSynchronize(end##label);					\
+    cudaEventElapsedTime(&runTime_##label, start##label, end##label);	\
+    cudaEventDestroy(start##label);					\
+    cudaEventDestroy(end##label);					\
+  }
+
 
 int xgpuCudaXengine(XGPUContext *context, int syncOp)
 {
@@ -578,7 +584,9 @@ int xgpuCudaXengine(XGPUContext *context, int syncOp)
   //allocated exactly as many thread blocks as are needed
   dim3 dimGrid(((Nblock/2+1)*(Nblock/2))/2, compiletime_info.nfrequency);
 
-  CUBE_ASYNC_START(ENTIRE_PIPELINE);
+
+  float runTime_entire, runTime_loop;
+  XGPU_ASYNC_START(entire);
 
   // Need to fill pipeline before loop
   long long unsigned int vecLengthPipe = compiletime_info.vecLengthPipe;
@@ -587,15 +595,15 @@ int xgpuCudaXengine(XGPUContext *context, int syncOp)
   // buffer 0.  This is a no-op unless previous call to xgpuCudaXengine() had
   // SYNCOP_NONE or SYNCOP_SYNC_TRANSFER.
   cudaStreamWaitEvent(streams[0], kernelCompletion[0], 0);
-  CUBE_ASYNC_COPY_CALL(array_d[0], array_hp, vecLengthPipe*sizeof(ComplexInput), cudaMemcpyHostToDevice, streams[0]);
+  cudaMemcpyAsync(array_d[0], array_hp, vecLengthPipe*sizeof(ComplexInput), cudaMemcpyHostToDevice, streams[0]);
   cudaEventRecord(copyCompletion[0], streams[0]); // record the completion of the h2d transfer
   checkCudaError();
 
-  CUBE_ASYNC_START(PIPELINE_LOOP);
-
 #ifdef POWER_LOOP
-  for (int q=0; ; q++)
+  for (int q=0; ; q++) {
 #endif
+  XGPU_ASYNC_START(loop);
+
   for (int p=1; p<PIPE_LENGTH; p++) {
     array_compute = array_d[(p+1)%2];
     array_load = array_d[p%2];
@@ -603,60 +611,248 @@ int xgpuCudaXengine(XGPUContext *context, int syncOp)
     // Kernel Calculation
 #if TEXTURE_DIM == 2
 #ifndef DP4A
-    cudaBindTexture2D(0, tex2dfloat2, array_compute, channelDesc, NFREQUENCY*NSTATION*NPOL, NTIME_PIPE,
-		      NFREQUENCY*NSTATION*NPOL*sizeof(ComplexInput));
+    // create texture object
+    cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeLinear;
+    resDesc.res.linear.devPtr = (ComplexInput*)array_compute;
+    resDesc.res.linear.desc = channelDesc;
+    resDesc.res.linear.sizeInBytes = NFREQUENCY*NSTATION*NPOL*NTIME_PIPE*sizeof(ComplexInput);
+    
+    cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.readMode = cudaReadModeElementType;
+    
+    // create texture object: we only have to do this once!
+    cudaTextureObject_t tex=0;
+    cudaCreateTextureObject(&tex, &resDesc, &texDesc, NULL);
+    checkCudaError();
 #else
-    cudaBindTexture2D(0, tex2dchar4, array_compute, channelDesc, NFREQUENCY*NSTATION*NPOL, NTIME_PIPE/4,
-		      NFREQUENCY*NSTATION*NPOL*2*sizeof(char4));
+    // create texture object
+    cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeLinear;
+    resDesc.res.linear.devPtr = (ComplexInput*)array_compute;
+    resDesc.res.linear.desc = channelDesc;
+    resDesc.res.linear.sizeInBytes = NFREQUENCY*NSTATION*NPOL*2*(NTIME_PIPE/4)*sizeof(char4);
+    
+    cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.readMode = cudaReadModeElementType;
+    
+    // create texture object: we only have to do this once!
+    cudaTextureObject_t tex=0;
+    cudaCreateTextureObject(&tex, &resDesc, &texDesc, NULL);
+    checkCudaError();
 #endif
 #else
 #ifndef DP4A
-    cudaBindTexture(0, tex1dfloat2, array_compute, channelDesc, NFREQUENCY*NSTATION*NPOL*NTIME_PIPE*sizeof(ComplexInput));
+#warning "DMH: ndef DP4A cudaBindTexture compile 1"
+    printf("textureDim compile 1 = %d\n", TEXTURE_DIM);
+    
+    // create texture object
+    cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeLinear;
+    resDesc.res.linear.devPtr = (ComplexInput*)array_compute;
+    resDesc.res.linear.desc = channelDesc;
+    resDesc.res.linear.sizeInBytes = NFREQUENCY*NSTATION*NPOL*NTIME_PIPE*sizeof(ComplexInput);
+    
+    cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.readMode = cudaReadModeElementType;
+    
+    // create texture object: we only have to do this once!
+    cudaTextureObject_t tex=0;
+    cudaCreateTextureObject(&tex, &resDesc, &texDesc, NULL);
+    checkCudaError();
 #else
-    cudaBindTexture(0, tex1dchar4, array_compute, channelDesc, NFREQUENCY*NSTATION*NPOL*(NTIME_PIPE/4)*sizeof(int2));
+#warning "DMH: def DP4A cudaBindTexture compile 1"
+    printf("Enabling texture bind compile tex1dchar4 1\n");
+    // create texture object
+    cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeLinear;
+    resDesc.res.linear.devPtr = (ComplexInput*)array_compute;
+    resDesc.res.linear.desc = channelDesc;
+    resDesc.res.linear.sizeInBytes = NFREQUENCY*NSTATION*NPOL*(NTIME_PIPE/4)*sizeof(int2);
+    
+    cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.readMode = cudaReadModeElementType;
+    
+    // create texture object: we only have to do this once!
+    cudaTextureObject_t tex=0;
+    cudaCreateTextureObject(&tex, &resDesc, &texDesc, NULL);
+    checkCudaError();
 #endif
 #endif
     cudaStreamWaitEvent(streams[1], copyCompletion[(p+1)%2], 0); // only start the kernel once the h2d transfer is complete
-    CUBE_ASYNC_KERNEL_CALL(shared2x2, dimGrid, dimBlock, 0, streams[1], 
-			   matrix_real_d, matrix_imag_d, NSTATION, writeMatrix);
+
+    shared2x2 <<< dimGrid, dimBlock, 0, streams[1] >>>(matrix_real_d, matrix_imag_d, NSTATION, writeMatrix, tex);
+    cudaDestroyTextureObject(tex);
+
     cudaEventRecord(kernelCompletion[(p+1)%2], streams[1]); // record the completion of the kernel
+    cudaGetErrorName(cudaGetLastError());
     checkCudaError();
 
     // Download next chunk of input data
     cudaStreamWaitEvent(streams[0], kernelCompletion[p%2], 0); // only start the transfer once the kernel has completed
-    CUBE_ASYNC_COPY_CALL(array_load, array_hp+p*vecLengthPipe, vecLengthPipe*sizeof(ComplexInput), cudaMemcpyHostToDevice, streams[0]);
+    cudaMemcpyAsync(array_load, array_hp+p*vecLengthPipe, vecLengthPipe*sizeof(ComplexInput), cudaMemcpyHostToDevice, streams[0]);
     cudaEventRecord(copyCompletion[p%2], streams[0]); // record the completion of the h2d transfer
     checkCudaError();
   }
 
-  CUBE_ASYNC_END(PIPELINE_LOOP);
+  XGPU_ASYNC_END(loop);
+
+  {
+#ifdef POWER_LOOP
+    double gflops_loop = 1e-9 * 8 * NFREQUENCY * (NTIME - NTIME_PIPE) * (NPOL*NSTATION-1) * NPOL*NSTATION / 2;
+#ifdef DP4A
+    double peak = 4 * 2 * cuda_cores * 1e-3 * GPUmon_sm_clock; // GOPS
+#else
+    double peak = 2 * cuda_cores * 1e-3 * GPUmon_sm_clock; // GFLOPS
+#endif
+
+    static long long count = 0;
+
+    count++;
+    const int offset = 20;
+    if (count > offset) {
+      count -= offset;
+
+      double time = 1e-3 * runTime_loop;
+
+      double power = 1e-3 * GPUmon_power;
+      static double power_sum = 0, power2_sum = 0;
+      power_sum += power;
+      power2_sum += power*power;
+
+      double gflops = gflops_loop / time;
+      static double gflops_sum = 0, gflops2_sum = 0;
+      gflops_sum += gflops;
+      gflops2_sum += gflops*gflops;
+
+      double temp = GPUmon_temp;
+      static double temp_sum = 0, temp2_sum = 0;
+      temp_sum += temp;
+      temp2_sum += temp*temp;
+
+      double eff = gflops / power;
+      static double eff_sum = 0, eff2_sum = 0;
+      eff_sum += eff;
+      eff2_sum += eff*eff;
+
+      double power_mean = power_sum / count;
+      double power_std = sqrt(power2_sum/(count-1) - power_sum*power_sum/(count * (count-1)));
+      double temp_mean = temp_sum / count;
+      double temp_std = sqrt(temp2_sum/(count-1) - temp_sum*temp_sum/(count * (count-1)));
+      double gflops_mean = gflops_sum / count;
+      double gflops_std = sqrt(gflops2_sum/(count-1) - gflops_sum*gflops_sum/(count * (count-1)));
+      double eff_mean = eff_sum / count;
+      double eff_std = sqrt(eff2_sum/(count-1) - eff_sum*eff_sum/(count * (count-1)));
+
+      printf("Time = %f; Power = %f (%f,%f); Temp = %f (%f,%f); GFLOPS =  %f (%f,%f); GFLOPS/watt = %f (%f,%f); Peak = %f; Percent of peak = %f \n",
+	     time, power, power_mean, power_std, temp, temp_mean, temp_std, gflops, gflops_mean, gflops_std,
+	     eff, eff_mean, eff_std, peak, gflops / peak);
+
+      count += offset;
+    }
+  }
+#endif
+  }
 
   array_compute = array_d[(PIPE_LENGTH+1)%2];
   // Final kernel calculation
 #if TEXTURE_DIM == 2
 #ifndef DP4A
-    cudaBindTexture2D(0, tex2dfloat2, array_compute, channelDesc, NFREQUENCY*NSTATION*NPOL, NTIME_PIPE,
-		      NFREQUENCY*NSTATION*NPOL*sizeof(ComplexInput));
+      // create texture object
+    cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeLinear;
+    resDesc.res.linear.devPtr = (ComplexInput*)array_compute;
+    resDesc.res.linear.desc = channelDesc;
+    resDesc.res.linear.sizeInBytes = NFREQUENCY*NSTATION*NPOL*NTIME_PIPE*sizeof(ComplexInput);
+    
+    cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.readMode = cudaReadModeElementType;
+    
+    // create texture object: we only have to do this once!
+    cudaTextureObject_t tex=0;
+    cudaCreateTextureObject(&tex, &resDesc, &texDesc, NULL);
+    checkCudaError();
 #else
-    cudaBindTexture2D(0, tex2dchar4, array_compute, channelDesc, NFREQUENCY*NSTATION*NPOL, NTIME_PIPE/4,
-		      NFREQUENCY*NSTATION*NPOL*2*sizeof(char4));
+    // create texture object
+    cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeLinear;
+    resDesc.res.linear.devPtr = (ComplexInput*)array_compute;
+    resDesc.res.linear.desc = channelDesc;
+    resDesc.res.linear.sizeInBytes = NFREQUENCY*NSTATION*NPOL*2*(NTIME_PIPE/4)*sizeof(char4);
+    
+    cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.readMode = cudaReadModeElementType;
+    
+    // create texture object: we only have to do this once!
+    cudaTextureObject_t tex=0;
+    cudaCreateTextureObject(&tex, &resDesc, &texDesc, NULL);
+    checkCudaError();
 #endif
 #else
 #ifndef DP4A
-    cudaBindTexture(0, tex1dfloat2, array_compute, channelDesc, NFREQUENCY*NSTATION*NPOL*NTIME_PIPE*sizeof(ComplexInput));
+#warning "DMH: ndef DP4A cudaBindTexture compile 2"
+    printf("textureDim compile 2 = %d\n", TEXTURE_DIM);
+    // create texture object
+    cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeLinear;
+    resDesc.res.linear.devPtr = (ComplexInput*)array_compute;
+    resDesc.res.linear.desc = channelDesc;
+    resDesc.res.linear.sizeInBytes = NFREQUENCY*NSTATION*NPOL*NTIME_PIPE*sizeof(ComplexInput);
+    
+    cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.readMode = cudaReadModeElementType;
+    
+    // create texture object: we only have to do this once!
+    cudaTextureObject_t tex=0;
+    cudaCreateTextureObject(&tex, &resDesc, &texDesc, NULL);
+    checkCudaError();
 #else
-    cudaBindTexture(0, tex1dchar4, array_compute, channelDesc, NFREQUENCY*NSTATION*NPOL*(NTIME_PIPE/4)*sizeof(int2));
+#warning "DMH: def DP4A cudaBindTexture compile 2"
+    // create texture object
+    cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeLinear;
+    resDesc.res.linear.devPtr = (ComplexInput*)array_compute;
+    resDesc.res.linear.desc = channelDesc;
+    resDesc.res.linear.sizeInBytes = NFREQUENCY*NSTATION*NPOL*(NTIME_PIPE/4)*sizeof(int2);
+    
+    cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.readMode = cudaReadModeElementType;
+    
+    // create texture object: we only have to do this once!
+    cudaTextureObject_t tex=0;
+    cudaCreateTextureObject(&tex, &resDesc, &texDesc, NULL);
+    checkCudaError();
 #endif
 #endif
   cudaStreamWaitEvent(streams[1], copyCompletion[(PIPE_LENGTH+1)%2], 0);
-  CUBE_ASYNC_KERNEL_CALL(shared2x2, dimGrid, dimBlock, 0, streams[1], matrix_real_d, matrix_imag_d,
-			 NSTATION, writeMatrix);
 
+  shared2x2 <<<dimGrid, dimBlock, 0, streams[1]>>> (matrix_real_d, matrix_imag_d, NSTATION, writeMatrix, tex);
+
+  cudaDestroyTextureObject(tex);
+  
   if(syncOp == SYNCOP_DUMP) {
     checkCudaError();
+    cudaGetErrorName(cudaGetLastError());
     //copy the data back, employing a similar strategy as above
-    CUBE_COPY_CALL(context->matrix_h + context->output_offset, internal->matrix_d, compiletime_info.matLength*sizeof(Complex), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(context->matrix_h + context->output_offset, internal->matrix_d, compiletime_info.matLength*sizeof(Complex), cudaMemcpyDeviceToHost);
     checkCudaError();
+    cudaGetErrorName(cudaGetLastError());
   } else if(syncOp == SYNCOP_SYNC_COMPUTE) {
     // Synchronize on the compute stream (i.e. wait for it to complete)
     cudaStreamSynchronize(streams[1]);
@@ -664,14 +860,20 @@ int xgpuCudaXengine(XGPUContext *context, int syncOp)
       // record the completion of the kernel for next call
       cudaEventRecord(kernelCompletion[(PIPE_LENGTH+1)%2], streams[1]);
       checkCudaError();
-
+      cudaGetErrorName(cudaGetLastError());
       if(syncOp == SYNCOP_SYNC_TRANSFER) {
         // Synchronize on the transfer stream (i.e. wait for it to complete)
         cudaStreamSynchronize(streams[0]);
       }
   }
 
-  CUBE_ASYNC_END(ENTIRE_PIPELINE);
+  XGPU_ASYNC_END(entire);
+
+  double gflops_entire = 1e-9 * 8 * NFREQUENCY * NTIME * (NPOL*NSTATION-1) * NPOL*NSTATION / 2;
+  double gflops_loop = 1e-9 * 8 * NFREQUENCY * (NTIME - NTIME_PIPE) * (NPOL*NSTATION-1) * NPOL*NSTATION / 2;
+
+  printf("Time: entire pipeline = %f, loop = %f; GFLOPS: entire pipeline = %f, loop = %f\n",
+	 runTime_entire, runTime_loop, gflops_entire / (1e-3*runTime_entire), gflops_loop / (1e-3*runTime_loop));
 
   return XGPU_OK;
 }
