@@ -17,7 +17,7 @@
 
 #include "xgpu.h"
 #include "xgpu_info.h"
-#include "xgpu_version.h"
+//#include "xgpu_version.h"
 #include "power.h"
 
 // whether we are writing the matrix back to device memory (used for benchmarking)
