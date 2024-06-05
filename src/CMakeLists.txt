@@ -29,7 +29,6 @@ set(XGPU_HEADERS
   power.h
   xgpu.h
   xgpu_info.h
-  xgpu_version.h
   )
 install(FILES ${XGPU_HEADERS} DESTINATION include)
 
